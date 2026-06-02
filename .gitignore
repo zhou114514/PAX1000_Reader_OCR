@@ -209,6 +209,8 @@ __marimo__/
 .vscode/
 .idea/
 .svn/
-config.ini
-1.py
-电源采集数据/
+pax1000_calibrate.png
+config.json
+output/
+*.jsonl
+pax1000_calibrate.png

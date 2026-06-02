@@ -16,6 +16,7 @@ import cv2
 import mss
 import numpy as np
 import win32gui
+import win32con
 import pytesseract
 from dataclasses import dataclass, asdict
 from typing import Optional, Callable
@@ -27,11 +28,20 @@ try:
 except Exception:
     pass
 
-from tesseract_setup import ensure_tesseract
+def _apply_tesseract_from_config() -> None:
+    """从同目录 config.json 读取 tesseract_cmd 并设置；构造时可用参数覆盖"""
+    import json as _j
+    import os as _o
+    cfg_path = _o.path.join(_o.path.dirname(_o.path.abspath(__file__)), "config.json")
+    if _o.path.isfile(cfg_path):
+        try:
+            tess = _j.load(open(cfg_path, encoding="utf-8")).get("tesseract_cmd", "")
+            if tess:
+                pytesseract.pytesseract.tesseract_cmd = tess
+        except Exception:
+            pass
 
-# pytesseract.pytesseract.tesseract_cmd = ensure_tesseract()
-tesseract_cmd = r"D:\TesseractOCR\tesseract.exe"
-pytesseract.pytesseract.tesseract_cmd = tesseract_cmd
+_apply_tesseract_from_config()
 
 
 @dataclass
@@ -70,6 +80,7 @@ class PAX1000Reader:
         "h_ratio": 0.18,   # 浮窗高度   = 窗口高度 × 此比例
     }
 
+    WINDOW_CLASS_KEYWORD = "ThorlabsPAX1000"
     WINDOW_TITLE_KEYWORD = "PAX1000"
 
     def __init__(self, roi_config: dict = None, tesseract_cmd: str = None):
@@ -95,19 +106,27 @@ class PAX1000Reader:
             ]
 
     def find_window(self) -> Optional[tuple]:
-        """查找 PAX1000 窗口，返回 (left, top, right, bottom)"""
+        """
+        通过窗口类名精确查找 ThorlabsPAX1000.exe 的窗口。
+        返回 (hwnd, left, top, right, bottom)。
+        即使窗口最小化也会返回（由调用方决定是否恢复）。
+        """
         result = []
         def _cb(hwnd, _):
-            if win32gui.IsWindowVisible(hwnd):
-                title = win32gui.GetWindowText(hwnd)
-                if self.WINDOW_TITLE_KEYWORD in title:
-                    result.append(win32gui.GetWindowRect(hwnd))
+            cls = win32gui.GetClassName(hwnd)
+            if self.WINDOW_CLASS_KEYWORD not in cls:
+                return
+            title = win32gui.GetWindowText(hwnd)
+            if self.WINDOW_TITLE_KEYWORD in title:
+                result.append((hwnd, *win32gui.GetWindowRect(hwnd)))
         win32gui.EnumWindows(_cb, None)
         return result[0] if result else None
 
+    # ──── 截图 & 预处理 ────
+
     def _roi_screen_rect(self, win_rect) -> dict:
         """根据比例 ROI 和窗口实际尺寸，计算屏幕绝对坐标"""
-        wl, wt, wr, wb = win_rect
+        _, wl, wt, wr, wb = win_rect
         win_w = wr - wl
         win_h = wb - wt
         return {
@@ -117,17 +136,54 @@ class PAX1000Reader:
             "height": int(win_h * self.roi["h_ratio"]),
         }
 
-    # ──── 截图 & 预处理 ────
+    def capture_roi(self, win_info=None) -> np.ndarray:
+        """
+        截取整个虚拟桌面，再按窗口位置和 ROI 比例裁剪目标区域。
 
-    def capture_roi(self, win_rect=None) -> np.ndarray:
-        if win_rect is None:
-            win_rect = self.find_window()
-            if win_rect is None:
+        始终截取完整桌面（所有显示器的合并区域），然后根据 PAX1000
+        窗口的位置计算 ROI 在桌面上的绝对坐标并裁剪。
+        此方式不依赖窗口是否处于激活/前台状态，只要窗口未被完全遮挡即可。
+        """
+        if win_info is None:
+            win_info = self.find_window()
+            if win_info is None:
                 raise RuntimeError("未找到 PAX1000 窗口，请确认软件已打开")
-        rect = self._roi_screen_rect(win_rect)
-        with mss.mss() as sct:
-            shot = sct.grab(rect)
-            return np.array(shot)[:, :, :3]
+
+        hwnd = win_info[0]
+        if win32gui.IsIconic(hwnd):
+            win32gui.ShowWindow(hwnd, win32con.SW_RESTORE)
+            import time as _t
+            _t.sleep(0.3)
+            win_info = (hwnd, *win32gui.GetWindowRect(hwnd))
+
+        roi = self._roi_screen_rect(win_info)
+
+        with mss.MSS() as sct:
+            virtual = sct.monitors[0]
+            full = np.array(sct.grab(virtual))
+
+        x = roi["left"]   - virtual["left"]
+        y = roi["top"]    - virtual["top"]
+        w = roi["width"]
+        h = roi["height"]
+
+        if w <= 0 or h <= 0:
+            raise RuntimeError("ROI 尺寸无效，请检查 roi_config 中的比例值")
+
+        img_h, img_w = full.shape[:2]
+        x0 = max(0, x)
+        y0 = max(0, y)
+        x1 = min(img_w, x + w)
+        y1 = min(img_h, y + h)
+
+        if x1 <= x0 or y1 <= y0:
+            raise RuntimeError(
+                f"ROI 超出屏幕范围（x={x}, y={y}, w={w}, h={h}），"
+                "请确认 PAX1000 窗口在屏幕可见范围内"
+            )
+
+        region_bgra = np.ascontiguousarray(full[y0:y1, x0:x1])
+        return cv2.cvtColor(region_bgra, cv2.COLOR_BGRA2BGR)
 
     @staticmethod
     def preprocess(img_bgr: np.ndarray) -> np.ndarray:
@@ -288,34 +344,51 @@ class PAX1000Reader:
     # ──── 校准工具 ────
 
     def calibrate(self, save_path: str = "pax1000_calibrate.png"):
-        """截取整个窗口，用绿框标记当前 ROI，保存图片供人工确认"""
-        # 打印显示器信息
+        """截取整个桌面，用绿框标记当前 ROI，保存图片供人工确认"""
         monitors = self.get_monitor_info()
         print("=== 显示器信息 ===")
         for m in monitors:
             print(f"  显示器 {m['index']}: {m['width']}×{m['height']}  "
                   f"offset=({m['left']}, {m['top']})")
 
-        win_rect = self.find_window()
-        if win_rect is None:
+        win_info = self.find_window()
+        if win_info is None:
             print("未找到 PAX1000 窗口！")
             return
 
-        wl, wt, wr, wb = win_rect
+        hwnd = win_info[0]
+        if win32gui.IsIconic(hwnd):
+            print("  PAX1000 窗口处于最小化状态，正在恢复...")
+            win32gui.ShowWindow(hwnd, win32con.SW_RESTORE)
+            time.sleep(0.3)
+            win_info = (hwnd, *win32gui.GetWindowRect(hwnd))
+
+        _, wl, wt, wr, wb = win_info
         win_w, win_h = wr - wl, wb - wt
         print(f"\n=== PAX1000 窗口 ===")
         print(f"  位置: left={wl}  top={wt}  size={win_w}×{win_h}")
 
         with mss.MSS() as sct:
-            full = sct.grab({"left": wl, "top": wt,
-                             "width": win_w, "height": win_h})
-            img = np.ascontiguousarray(np.array(full)[:, :, :3])
+            virtual = sct.monitors[0]
+            full_screen = np.array(sct.grab(virtual))
 
-        roi = self._roi_screen_rect(win_rect)
-        rx, ry = roi["left"] - wl, roi["top"] - wt
+        # 直接在整个桌面截图上标记 ROI 和窗口边界
+        img = cv2.cvtColor(np.ascontiguousarray(full_screen), cv2.COLOR_BGRA2BGR)
+
+        roi = self._roi_screen_rect(win_info)
+        # ROI 在截图中的像素坐标（虚拟桌面可能有负偏移）
+        rx = roi["left"] - virtual["left"]
+        ry = roi["top"] - virtual["top"]
+        # 绿框：ROI 区域
         cv2.rectangle(img, (rx, ry),
                       (rx + roi["width"], ry + roi["height"]),
-                      (0, 255, 0), 2)
+                      (0, 255, 0), 3)
+        # 蓝框：PAX1000 窗口边界
+        wx = wl - virtual["left"]
+        wy = wt - virtual["top"]
+        cv2.rectangle(img, (wx, wy), (wx + win_w, wy + win_h),
+                      (255, 0, 0), 2)
+
         cv2.imwrite(save_path, img)
 
         print(f"\n=== ROI（自动按窗口尺寸换算）===")
@@ -323,7 +396,7 @@ class PAX1000Reader:
         print(f"  实际像素 : x={rx}  y={ry}  "
               f"w={roi['width']}  h={roi['height']}")
         print(f"\n已保存校准图 → {save_path}")
-        print("绿框 = 当前 ROI，请打开图片确认是否对准浮窗。")
+        print("图片为整个桌面截图：蓝框 = PAX1000 窗口，绿框 = ROI 区域。")
         print("如有偏移，调整 roi_config 中的比例值后重新运行 calibrate。")
 
 
