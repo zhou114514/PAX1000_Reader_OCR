@@ -58,6 +58,7 @@ DEFAULT_CONFIG: dict = {
     "auto_interval":        2.0,
     "output_dir":           "output",
     "output_prefix":        "pax1000",
+    "remote_screenshot_dir": "remote_screenshots",
     "single_attempts":      3,
 }
 
@@ -473,16 +474,19 @@ class PAX1000App:
             )
         self.root.after(0, lambda: self._capture_btn.config(state=tk.NORMAL))
 
-    def _multi_attempt(self, n: int = 3) -> tuple:
+    def _multi_attempt(self, n: int = 3, save_full_path: str = None) -> tuple:
         """
         对同一场景做 n 次独立识别，取众数结果。
         返回 (PAX1000Reading, None) 或 (None, 错误信息)。
         """
         results, last_err = [], None
+        saved_full = False
         with self._capture_lock:
             for _ in range(n):
                 try:
                     results.append(self.reader.read_once())
+                    if save_full_path and not saved_full:
+                        saved_full = self.reader.save_last_full_screenshot(save_full_path)
                 except Exception as e:
                     last_err = str(e)
 
@@ -784,6 +788,23 @@ class PAX1000App:
     def _send(conn: socket.socket, obj: dict) -> None:
         conn.sendall(json.dumps(obj, ensure_ascii=False).encode("utf-8") + b"\n")
 
+    def _remote_screenshot_path(self, opcode: str) -> str:
+        out_dir = self._dir_var.get() or self.config.get("output_dir", "output")
+        screenshot_dir = self.config.get("remote_screenshot_dir", "remote_screenshots")
+        if not os.path.isabs(screenshot_dir):
+            screenshot_dir = os.path.join(out_dir, screenshot_dir)
+        os.makedirs(screenshot_dir, exist_ok=True)
+
+        prefix = self._prefix_var.get() or self.config.get("output_prefix", "pax1000")
+        stamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
+        return os.path.join(screenshot_dir, f"{prefix}_{opcode}_{stamp}.png")
+
+    @staticmethod
+    def _attach_screenshot_path(value: dict, screenshot_path: str) -> dict:
+        if screenshot_path and os.path.isfile(screenshot_path):
+            value["screenshot_path"] = screenshot_path
+        return value
+
     def _dispatch(self, req: dict) -> dict:
         opcode = req.get("opcode", "")
 
@@ -801,27 +822,31 @@ class PAX1000App:
                     r = self.latest_reading
                 if r is None:
                     return fail("自动采集尚未获得任何数据，请先点击「开始采集」")
-                return ok(self._r2dict(r))
+                screenshot_path = self._remote_screenshot_path(opcode)
+                self.reader.save_last_full_screenshot(screenshot_path)
+                return ok(self._attach_screenshot_path(self._r2dict(r), screenshot_path))
             else:
                 # 单次模式：触发新一次采集
                 n = int(self.config.get("single_attempts", 3))
-                r, e = self._multi_attempt(n)
+                screenshot_path = self._remote_screenshot_path(opcode)
+                r, e = self._multi_attempt(n, save_full_path=screenshot_path)
                 if r:
                     with self._lock:
                         self.latest_reading = r
                     self.root.after(0, lambda rr=r: self._show_reading(rr))
-                    return ok(self._r2dict(r))
+                    return ok(self._attach_screenshot_path(self._r2dict(r), screenshot_path))
                 return fail(e or "识别失败")
 
         # ── CaptureOnce：强制一次单次采集 ──
         elif opcode == "CaptureOnce":
             n = int(self.config.get("single_attempts", 3))
-            r, e = self._multi_attempt(n)
+            screenshot_path = self._remote_screenshot_path(opcode)
+            r, e = self._multi_attempt(n, save_full_path=screenshot_path)
             if r:
                 with self._lock:
                     self.latest_reading = r
                 self.root.after(0, lambda rr=r: self._show_reading(rr))
-                return ok(self._r2dict(r))
+                return ok(self._attach_screenshot_path(self._r2dict(r), screenshot_path))
             return fail(e or "识别失败")
 
         # ── GetStatus ──

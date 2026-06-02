@@ -87,6 +87,7 @@ class PAX1000Reader:
         if tesseract_cmd:
             pytesseract.pytesseract.tesseract_cmd = tesseract_cmd
         self.roi = roi_config or self.DEFAULT_ROI.copy()
+        self.last_full_screenshot: Optional[np.ndarray] = None
 
     # ──── 窗口定位 ────
 
@@ -136,7 +137,7 @@ class PAX1000Reader:
             "height": int(win_h * self.roi["h_ratio"]),
         }
 
-    def capture_roi(self, win_info=None) -> np.ndarray:
+    def capture_roi(self, win_info=None, save_full_path: str = None) -> np.ndarray:
         """
         截取整个虚拟桌面，再按窗口位置和 ROI 比例裁剪目标区域。
 
@@ -162,6 +163,11 @@ class PAX1000Reader:
             virtual = sct.monitors[0]
             full = np.array(sct.grab(virtual))
 
+        full_bgr = cv2.cvtColor(np.ascontiguousarray(full), cv2.COLOR_BGRA2BGR)
+        self.last_full_screenshot = full_bgr
+        if save_full_path:
+            cv2.imwrite(save_full_path, full_bgr)
+
         x = roi["left"]   - virtual["left"]
         y = roi["top"]    - virtual["top"]
         w = roi["width"]
@@ -170,7 +176,7 @@ class PAX1000Reader:
         if w <= 0 or h <= 0:
             raise RuntimeError("ROI 尺寸无效，请检查 roi_config 中的比例值")
 
-        img_h, img_w = full.shape[:2]
+        img_h, img_w = full_bgr.shape[:2]
         x0 = max(0, x)
         y0 = max(0, y)
         x1 = min(img_w, x + w)
@@ -182,8 +188,13 @@ class PAX1000Reader:
                 "请确认 PAX1000 窗口在屏幕可见范围内"
             )
 
-        region_bgra = np.ascontiguousarray(full[y0:y1, x0:x1])
-        return cv2.cvtColor(region_bgra, cv2.COLOR_BGRA2BGR)
+        return np.ascontiguousarray(full_bgr[y0:y1, x0:x1])
+
+    def save_last_full_screenshot(self, save_path: str) -> bool:
+        """保存最近一次用于 OCR 的全屏截图。返回是否成功保存。"""
+        if self.last_full_screenshot is None:
+            return False
+        return bool(cv2.imwrite(save_path, self.last_full_screenshot))
 
     @staticmethod
     def preprocess(img_bgr: np.ndarray) -> np.ndarray:
@@ -301,9 +312,9 @@ class PAX1000Reader:
 
     # ──── 对外接口 ────
 
-    def read_once(self) -> PAX1000Reading:
+    def read_once(self, save_full_path: str = None) -> PAX1000Reading:
         """单次读取，可直接集成到你的程序中"""
-        img = self.capture_roi()
+        img = self.capture_roi(save_full_path=save_full_path)
         bw  = self.preprocess(img)
         txt = self.ocr(bw)
         return self.parse(txt)
