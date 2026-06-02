@@ -752,29 +752,34 @@ class PAX1000App:
                 break
 
     def _handle_client(self, conn: socket.socket) -> None:
+        """持久连接：循环接收多条请求，每条请求以换行符结尾，直到客户端断开。"""
         try:
-            conn.settimeout(30.0)
+            conn.settimeout(60.0)
             buf = b""
             while True:
-                chunk = conn.recv(4096)
+                try:
+                    chunk = conn.recv(4096)
+                except socket.timeout:
+                    # 超时不断开，继续等待
+                    continue
                 if not chunk:
+                    # 客户端主动关闭
                     break
                 buf += chunk
-                if buf.rstrip().endswith(b"}"):
-                    break
-
-            if not buf.strip():
-                return
-
-            try:
-                req = json.loads(buf.decode("utf-8"))
-            except json.JSONDecodeError:
-                self._send(conn, {"IsSuccessful": False, "Value": "",
-                                  "ErrorMessage": "请求不是合法的 JSON"})
-                return
-
-            resp = self._dispatch(req)
-            self._send(conn, resp)
+                # 按换行符切割，支持同一次 recv 携带多条消息
+                while b"\n" in buf:
+                    line, buf = buf.split(b"\n", 1)
+                    line = line.strip()
+                    if not line:
+                        continue
+                    try:
+                        req = json.loads(line.decode("utf-8"))
+                    except json.JSONDecodeError:
+                        self._send(conn, {"IsSuccessful": False, "Value": "",
+                                          "ErrorMessage": "请求不是合法的 JSON"})
+                        continue
+                    resp = self._dispatch(req)
+                    self._send(conn, resp)
 
         except Exception:
             pass
