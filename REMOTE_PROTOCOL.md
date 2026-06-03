@@ -1,6 +1,6 @@
 # PAX1000 远程协议记录
 
-协议版本：`1.1`
+协议版本：`1.2`
 
 适用程序：`PAX1000_App.py`
 
@@ -79,6 +79,7 @@ PAX1000 OCR 数据采集系统启动后，会在后台开启一个 TCP 服务。
 - `GetStatus`
 - `GetPAX1000Data`
 - `CaptureOnce`
+- `GetLastScreenshot`
 
 ## 5. 响应格式
 
@@ -294,6 +295,73 @@ PAX1000 OCR 数据采集系统启动后，会在后台开启一个 TCP 服务。
 }
 ```
 
+### 7.5 GetLastScreenshot
+
+用途：获取上次保存的全屏截图，图像数据以 Base64 编码内嵌于响应包内。
+
+请求：
+
+```json
+{
+  "opcode": "GetLastScreenshot",
+  "parameter": {}
+}
+```
+
+也可通过 `parameter.path` 指定想要获取的截图文件路径（必须是服务端本地可访问的绝对或相对路径）：
+
+```json
+{
+  "opcode": "GetLastScreenshot",
+  "parameter": {
+    "path": "output\\remote_screenshots\\pax1000_GetPAX1000Data_20260602_113141_123456.png"
+  }
+}
+```
+
+行为说明：
+
+- 优先使用 `parameter.path` 指定的文件（若存在）。
+- 若未指定 `path`，则使用最近一次截图操作留存在内存中的全屏图像（`reader.last_full_screenshot`），并将其保存到 `remote_screenshots` 目录后返回。
+- 若内存中无截图，则自动在 `remote_screenshots` 目录中按修改时间选取最新的 `.png` 文件。
+- 若以上三种来源均无可用截图，返回失败响应。
+- 图像以 PNG 格式编码，并以 Base64 字符串内嵌于 `Value.image_base64`。
+- 注意：全屏截图体积通常在 1 MB～10 MB 之间，Base64 后约增大 33%，客户端接收时需适当调大 recv 缓冲区或循环读取直至收到换行符。
+
+成功响应示例：
+
+```json
+{
+  "IsSuccessful": true,
+  "Value": {
+    "image_format": "png",
+    "image_size": 1572864,
+    "image_base64": "iVBORw0KGgoAAAANSUhEUgAA...(省略)...",
+    "screenshot_path": "output\\remote_screenshots\\pax1000_GetLastScreenshot_20260602_113141_123456.png"
+  },
+  "ErrorMessage": "Null"
+}
+```
+
+`Value` 字段说明：
+
+| 字段 | 类型 | 说明 |
+|------|------|------|
+| `image_format` | string | 固定为 `"png"` |
+| `image_size` | integer | PNG 文件字节数（Base64 解码后的原始大小） |
+| `image_base64` | string | Base64 编码的 PNG 图像数据 |
+| `screenshot_path` | string | 截图在服务端保存的路径；若使用指定 path 则与请求一致 |
+
+无可用截图的失败响应：
+
+```json
+{
+  "IsSuccessful": false,
+  "Value": "",
+  "ErrorMessage": "尚无可用截图，请先触发一次采集操作"
+}
+```
+
 ## 8. 客户端示例
 
 ### 8.1 Python 示例
@@ -331,7 +399,57 @@ if __name__ == "__main__":
     print(call_pax1000(opcode="GetPAX1000Data"))
 ```
 
-### 8.2 PowerShell 示例
+### 8.2 Python 示例：接收并保存截图
+
+```python
+import json
+import socket
+import base64
+
+
+def get_last_screenshot(host="127.0.0.1", port=10010,
+                        save_path="last_screenshot.png",
+                        specific_path=""):
+    """获取服务端最近一次截图并保存到本地。"""
+    param = {}
+    if specific_path:
+        param["path"] = specific_path
+
+    req = {"opcode": "GetLastScreenshot", "parameter": param}
+
+    with socket.create_connection((host, port), timeout=30) as sock:
+        sock.sendall(json.dumps(req, ensure_ascii=False).encode("utf-8") + b"\n")
+
+        # 截图响应体积较大，需循环接收直到换行符
+        chunks = []
+        while True:
+            chunk = sock.recv(65536)
+            if not chunk:
+                break
+            chunks.append(chunk)
+            if b"\n" in chunk:
+                break
+
+    raw = b"".join(chunks).decode("utf-8").strip()
+    resp = json.loads(raw)
+
+    if not resp["IsSuccessful"]:
+        raise RuntimeError(resp["ErrorMessage"])
+
+    img_bytes = base64.b64decode(resp["Value"]["image_base64"])
+    with open(save_path, "wb") as f:
+        f.write(img_bytes)
+
+    print(f"截图已保存：{save_path}（{len(img_bytes)} 字节）")
+    print(f"服务端路径：{resp['Value']['screenshot_path']}")
+    return save_path
+
+
+if __name__ == "__main__":
+    get_last_screenshot()
+```
+
+### 8.3 PowerShell 示例
 
 ```powershell
 $client = [System.Net.Sockets.TcpClient]::new("127.0.0.1", 10010)

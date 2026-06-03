@@ -27,6 +27,7 @@ import sys
 import json
 import csv
 import time
+import base64
 import threading
 import socket
 import logging
@@ -864,6 +865,53 @@ class PAX1000App:
                 "mode":         self._mode_var.get(),
                 "auto_running": self.auto_running,
                 "last_time":    last_t,
+            })
+
+        # ── GetLastScreenshot：返回上次截图的图像数据流 ──
+        elif opcode == "GetLastScreenshot":
+            param = req.get("parameter") or {}
+            specific_path = param.get("path", "")
+
+            img_data: bytes = b""
+            shot_path = ""
+
+            if specific_path and os.path.isfile(specific_path):
+                with open(specific_path, "rb") as f:
+                    img_data = f.read()
+                shot_path = specific_path
+            elif self.reader.last_full_screenshot is not None:
+                import cv2 as _cv2
+                ok_enc, buf = _cv2.imencode(".png", self.reader.last_full_screenshot)
+                if ok_enc:
+                    img_data = bytes(buf)
+                    shot_path = self._remote_screenshot_path(opcode)
+                    with open(shot_path, "wb") as _f:
+                        _f.write(img_data)
+            else:
+                out_dir = self._dir_var.get() or self.config.get("output_dir", "output")
+                screenshot_dir = self.config.get("remote_screenshot_dir", "remote_screenshots")
+                if not os.path.isabs(screenshot_dir):
+                    screenshot_dir = os.path.join(out_dir, screenshot_dir)
+                if os.path.isdir(screenshot_dir):
+                    candidates = sorted(
+                        [os.path.join(screenshot_dir, f)
+                         for f in os.listdir(screenshot_dir)
+                         if f.lower().endswith(".png")],
+                        key=os.path.getmtime,
+                    )
+                    if candidates:
+                        shot_path = candidates[-1]
+                        with open(shot_path, "rb") as _f:
+                            img_data = _f.read()
+
+            if not img_data:
+                return fail("尚无可用截图，请先触发一次采集操作")
+
+            return ok({
+                "image_format": "png",
+                "image_size":   len(img_data),
+                "image_base64": base64.b64encode(img_data).decode("ascii"),
+                "screenshot_path": shot_path,
             })
 
         # ── check（心跳）──
